@@ -1,10 +1,13 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import asyncio
 import logging
 import os
 import re
 import tempfile
 import gzip
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import aiohttp
 import pandas as pd
@@ -20,14 +23,19 @@ from telegram.ext import (
 )
 import xml.etree.ElementTree as ET
 
-# -------------------------
+# =========================
 # Config & Logging
-# -------------------------
+# =========================
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ONEHPING_API_KEY = os.getenv("ONEHPING_API_KEY", "").strip()
 ONEHPING_API_URL = "https://app.1hping.com/external/api/campaign/create?culture=vi-VN"
+
+# Cấu hình crawler
+SKIP_SSL_VERIFY = os.getenv("SKIP_SSL_VERIFY", "false").lower() == "true"
+CRAWLER_UA = os.getenv("CRAWLER_UA", "1hping-indexbot/1.0 (+https://app.1hping.com)")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "2000"))  # batch URL gửi mỗi campaign
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN in environment.")
@@ -40,41 +48,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger("1hping-bot")
 
-# -------------------------
-# Helpers
-# -------------------------
+# =========================
+# Helpers chung
+# =========================
 def sanitize_campaign_name(name: str) -> str:
     """Loại bỏ ký tự lạ, rút gọn chiều dài cho an toàn API."""
     name = re.sub(r"\s+", " ", name).strip()
     name = re.sub(r"[^A-Za-z0-9 _\-\.\(\)\[\]]+", "", name)
     return name[:120] if len(name) > 120 else name
 
+def _chunk(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+async def send_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+def _short(obj, n=1200):
+    s = str(obj)
+    return (s[:n] + "…") if len(s) > n else s
+
+# =========================
+# Đọc Excel -> URL
+# =========================
+def _is_excel(doc: Document) -> bool:
+    # Chỉ nhận .xlsx để tránh lỗi .xls/xlrd
+    excel_mimes = {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/octet-stream",
+    }
+    name = (doc.file_name or "").lower()
+    return (doc.mime_type in excel_mimes) and name.endswith(".xlsx")
+
 def extract_urls_from_excel(path: str) -> list[str]:
-    """Đọc mọi sheet, mọi cột; gom toàn bộ ô dạng text rồi lọc URL hợp lệ http/https."""
-    dfs = pd.read_excel(path, sheet_name=None, header=None, dtype=str, engine="openpyxl")
+    """Đọc mọi sheet, mọi cột; gom chuỗi chứa http/https và xác thực nhanh."""
+    dfs = pd.read_excel(path, sheet_name=None, header=None, dtype=str)
     urls = []
+    url_like = re.compile(r"https?://[^\s<>\"\']+", re.I)
     for _, df in dfs.items():
-        # Flatten các ô
         for val in df.to_numpy().flatten():
             if isinstance(val, str):
-                val = val.strip()
-                if val:
-                    urls.append(val)
-    # Lọc hợp lệ
-    valid = []
-    for u in urls:
-        parsed = urlparse(u)
-        if parsed.scheme in ("http", "https") and parsed.netloc:
-            valid.append(u)
-    # Loại trùng, giữ nguyên thứ tự
-    seen = set()
-    deduped = []
-    for u in valid:
-        if u not in seen:
-            seen.add(u)
-            deduped.append(u)
-    return deduped
+                for m in url_like.findall(val.strip()):
+                    parsed = urlparse(m)
+                    if parsed.scheme in ("http", "https") and parsed.netloc:
+                        urls.append(m)
+    # dedupe giữ thứ tự
+    return list(dict.fromkeys(urls))
 
+# =========================
+# Call 1hping
+# =========================
 async def call_1hping_create_campaign(
     session: aiohttp.ClientSession,
     campaign_name: str,
@@ -95,40 +118,49 @@ async def call_1hping_create_campaign(
         try:
             data = await resp.json()
         except Exception:
-            # Phòng khi server trả text không phải JSON
             data = {"raw": text}
         return {"status": resp.status, "data": data}
 
-async def send_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+async def call_1hping_in_batches(
+    session: aiohttp.ClientSession,
+    campaign_name: str,
+    number_of_day: int,
+    urls: list[str],
+    batch_size: int = BATCH_SIZE,
+) -> list[tuple[str, dict]]:
+    """Gọi API 1hping theo batch. Trả list (campaign_name_used, result_dict)."""
+    results = []
+    if not urls:
+        return results
+    parts = list(_chunk(urls, batch_size))
+    for idx, part in enumerate(parts, start=1):
+        name = campaign_name if len(parts) == 1 else f"{campaign_name}__part{idx}"
+        res = await call_1hping_create_campaign(session, name, number_of_day, part)
+        results.append((name, res))
+    return results
 
-# -------------------------
+# =========================
 # Sitemap utilities
-# -------------------------
+# =========================
 def _norm_domain(raw: str) -> str:
-    """Chuẩn hoá domain người dùng nhập: bỏ scheme/đường dẫn, chỉ giữ host (kèm sub nếu có)."""
-    raw = raw.strip()
+    """Chuẩn hoá domain người dùng nhập: bỏ scheme/đường dẫn, chỉ giữ host."""
+    raw = (raw or "").strip()
     if not raw:
         return ""
-    # Thêm scheme giả để parse nếu thiếu
     if not re.match(r"^https?://", raw, flags=re.I):
         raw = "http://" + raw
     p = urlparse(raw)
     host = (p.netloc or "").strip().lower()
-    # Bỏ cổng
-    host = host.split(":")[0]
-    # Bỏ www. nếu muốn; ở đây giữ nguyên để thử cả 2 biến thể
+    host = host.split(":")[0]  # bỏ cổng
     return host
 
 def _candidate_sitemap_urls(host: str) -> list[str]:
     """Sinh danh sách URL sitemap phổ biến để thử lần lượt (ưu tiên https)."""
-    # Thử cả host và www.host
     hosts = [host]
     if not host.startswith("www."):
         hosts.append("www." + host)
     cands = []
     for h in hosts:
-        # RankMath/Yoast phổ biến
         cands.extend([
             f"https://{h}/sitemap_index.xml",
             f"https://{h}/sitemap.xml",
@@ -139,17 +171,15 @@ def _candidate_sitemap_urls(host: str) -> list[str]:
 
 async def _fetch_bytes(session: aiohttp.ClientSession, url: str) -> bytes | None:
     try:
-        async with session.get(url, timeout=60) as resp:
+        async with session.get(url, headers={"User-Agent": CRAWLER_UA}, timeout=60) as resp:
             if resp.status != 200:
                 return None
             content = await resp.read()
-            # Nếu là .gz hoặc header nén
             ct = resp.headers.get("Content-Type", "")
-            if url.lower().endswith(".gz") or "gzip" in ct:
+            if url.lower().endswith(".gz") or "gzip" in ct or "application/gzip" in ct:
                 try:
                     return gzip.decompress(content)
                 except Exception:
-                    # Có thể server đã giải nén tự động
                     return content
             return content
     except Exception as e:
@@ -157,30 +187,26 @@ async def _fetch_bytes(session: aiohttp.ClientSession, url: str) -> bytes | None
         return None
 
 def _xml_findall(root: ET.Element, localname: str) -> list[ET.Element]:
-    """Tìm mọi node theo localname, bất chấp namespace."""
     return root.findall(f".//{{*}}{localname}")
 
 def _parse_sitemap_xml(xml_bytes: bytes) -> tuple[list[str], list[str]]:
     """
     Trả về (sitemap_links, page_urls).
-    - Nếu là sitemap index: trả về list các <loc> của sitemap con trong sitemap_links.
-    - Nếu là urlset: trả về list các <loc> trang trong page_urls.
+    - Nếu là sitemap index: trả về list <sitemap><loc>.
+    - Nếu là urlset: trả về list <url><loc>.
     """
     try:
         root = ET.fromstring(xml_bytes)
     except Exception:
         return [], []
 
-    sitemap_links = []
-    page_urls = []
+    sitemap_links, page_urls = [], []
 
-    # sitemap index
     for sm in _xml_findall(root, "sitemap"):
         loc_el = sm.find("{*}loc")
         if loc_el is not None and (loc := (loc_el.text or "").strip()):
             sitemap_links.append(loc)
 
-    # urlset
     for u in _xml_findall(root, "url"):
         loc_el = u.find("{*}loc")
         if loc_el is not None and (loc := (loc_el.text or "").strip()):
@@ -188,11 +214,12 @@ def _parse_sitemap_xml(xml_bytes: bytes) -> tuple[list[str], list[str]]:
 
     return sitemap_links, page_urls
 
-async def _collect_urls_from_sitemaps(session: aiohttp.ClientSession, entry_urls: list[str], limit_depth: int = 5) -> list[str]:
-    """
-    Duyệt đệ quy sitemap index -> sitemap con -> urlset, loại trùng, giữ thứ tự.
-    limit_depth: giới hạn độ sâu đệ quy để tránh vòng lặp hiếm gặp.
-    """
+async def _collect_urls_from_sitemaps(
+    session: aiohttp.ClientSession,
+    entry_urls: list[str],
+    limit_depth: int = 6,
+) -> list[str]:
+    """Duyệt đệ quy sitemap index -> sitemap con -> urlset, loại trùng, giữ thứ tự."""
     seen_sitemaps = set()
     seen_urls = set()
     ordered_urls = []
@@ -210,15 +237,14 @@ async def _collect_urls_from_sitemaps(session: aiohttp.ClientSession, entry_urls
             data = await _fetch_bytes(session, sm_url)
             if not data:
                 continue
+
             child_sitemaps, page_urls = _parse_sitemap_xml(data)
 
-            # Thêm URL trang
             for u in page_urls:
                 if u not in seen_urls:
                     seen_urls.add(u)
                     ordered_urls.append(u)
 
-            # Thêm sitemap con vào hàng đợi
             for c in child_sitemaps:
                 if c not in seen_sitemaps:
                     next_queue.append(c)
@@ -229,10 +255,7 @@ async def _collect_urls_from_sitemaps(session: aiohttp.ClientSession, entry_urls
     return ordered_urls
 
 async def _discover_sitemap_entry_points(session: aiohttp.ClientSession, host: str) -> list[str]:
-    """
-    Thử tải các URL sitemap phổ biến. Nếu sitemap_index.xml trả về thành công → dùng nó.
-    Nếu không, thử sitemap.xml. Nếu tìm được sitemap index trong nội dung thì thêm các <sitemap><loc>.
-    """
+    """Thử tải các URL sitemap phổ biến, trả về entry points (index hoặc urlset)."""
     candidates = _candidate_sitemap_urls(host)
     entry_points = []
 
@@ -243,48 +266,53 @@ async def _discover_sitemap_entry_points(session: aiohttp.ClientSession, host: s
         child_sitemaps, page_urls = _parse_sitemap_xml(data)
 
         if child_sitemaps:
-            # Đây là sitemap index → dùng chính nó làm entry
             entry_points.append(url)
-            # Đồng thời nối thêm các sitemap con trực tiếp để tăng độ phủ
             entry_points.extend(child_sitemaps)
             break
         elif page_urls:
-            # Đây là urlset → vẫn dùng được như entry
             entry_points.append(url)
             break
 
-    return list(dict.fromkeys(entry_points))  # dedupe giữ thứ tự
+    return list(dict.fromkeys(entry_points))
 
-# -------------------------
-# Bot Handlers
-# -------------------------
+# =========================
+# Bot: Menu & Handlers
+# =========================
+HELP_TEXT = (
+    "⚙️ Cú pháp lệnh:\n"
+    "• /start — hướng dẫn nhanh.\n"
+    "• /help — hiển thị menu cú pháp.\n"
+    "• Gửi file **Excel (.xlsx)**: bot sẽ trích xuất URL và hỏi số ngày, rồi tạo campaign.\n"
+    "• /indexweb <domain> — quét sitemap, gom URL, sau đó hỏi số ngày.\n"
+    "   Ví dụ: `/indexweb abc.com`\n"
+    "• /indexdomains [days] domain1 domain2 ... — ép index **nhiều domain** trực tiếp.\n"
+    "   - Nếu token đầu là số → dùng làm số ngày, mặc định 1 ngày nếu bỏ trống.\n"
+    "   Ví dụ: `/indexdomains 3 example.com abc.com`\n"
+    "           `/indexdomains example.com,another.com`\n"
+    "• /cancel — hủy phiên hiện tại.\n"
+)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     msg = (
         "Chào bạn. Gửi **file Excel (.xlsx)** chứa list URL cần ép index.\n"
-        "Hoặc dùng lệnh: `/indexweb <domain>` để lấy toàn bộ URL từ sitemap.\n"
-        "Sau khi có danh sách URL, mình sẽ hỏi bạn muốn chia trong **bao nhiêu ngày**.\n"
-        "Tên chiến dịch sẽ là: `TelegramName_UserID`.\n\n"
-        "Lệnh hữu ích:\n"
-        "• /indexweb abc.com — quét sitemap và gom URL\n"
-        "• /cancel — hủy phiên hiện tại và xóa trạng thái.\n"
+        "Hoặc dùng:\n"
+        "• `/indexweb <domain>` — quét sitemap và gom URL.\n"
+        "• `/indexdomains [days] domain1 domain2 ...` — ép index nhiều domain ngay.\n"
+        "Sau khi có danh sách URL (từ file hoặc sitemap), bot sẽ hỏi số ngày nếu cần.\n"
+        "Tên chiến dịch mặc định: `TelegramName_UserID`.\n\n"
+        "Gõ /help để xem menu cú pháp."
     )
     await update.message.reply_text(msg, disable_web_page_preview=True)
 
+async def help_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, disable_web_page_preview=True)
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Đã hủy và xóa trạng thái. Gửi lại file Excel hoặc dùng /indexweb để tạo chiến dịch mới.")
+    await update.message.reply_text("Đã hủy và xóa trạng thái. Gửi lại file Excel hoặc dùng /indexweb, /indexdomains.")
 
-def _is_excel(doc: Document) -> bool:
-    # Một số client gửi mime xlsx hoặc octet-stream; kiểm thêm phần mở rộng.
-    excel_mimes = {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/vnd.ms-excel",
-        "application/octet-stream",
-    }
-    name = (doc.file_name or "").lower()
-    return (doc.mime_type in excel_mimes) and (name.endswith(".xlsx") or name.endswith(".xls"))
-
+# ===== Handlers: Excel -> hỏi số ngày -> gọi API =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not _is_excel(doc):
@@ -320,7 +348,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Chỉ xử lý khi đang chờ số ngày
     if not context.user_data.get("awaiting_days"):
-        await update.message.reply_text("Gửi file Excel (.xlsx) để bắt đầu hoặc dùng /indexweb <domain>.")
+        await update.message.reply_text("Gửi file Excel (.xlsx) để bắt đầu hoặc dùng /indexweb <domain> hay /indexdomains.")
         return
 
     raw = (update.message.text or "").strip()
@@ -342,7 +370,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
-    # Tạo tên chiến dịch: TelegramName_UserID
     tg_user = update.effective_user
     display_name = tg_user.full_name or tg_user.username or "User"
     user_id = tg_user.id
@@ -358,52 +385,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
-    # Gọi API 1hping
     try:
         timeout = aiohttp.ClientTimeout(total=180)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            result = await call_1hping_create_campaign(session, campaign_name, days, urls)
+            results = await call_1hping_in_batches(session, campaign_name, days, urls, batch_size=BATCH_SIZE)
     except Exception as e:
         logger.exception("Error calling 1hping API")
         await update.message.reply_text(f"Lỗi gọi API 1hping: {e}")
         context.user_data.clear()
         return
 
-    status = result.get("status")
-    data = result.get("data")
+    lines = [f"✅ Kết quả tạo {len(results)} campaign:"]
+    for name, r in results:
+        status = r.get("status")
+        data = r.get("data")
+        ok = (status and 200 <= status < 300)
+        prefix = "• ✅" if ok else "• ❌"
+        lines.append(f"{prefix} {name} — HTTP {status} — {_short(data)}")
 
-    # Phản hồi kết quả rõ ràng
-    if status and 200 <= status < 300:
-        await update.message.reply_text(
-            "✅ Đã tạo chiến dịch ép index thành công trên 1hping.\n"
-            f"• HTTP Status: {status}\n"
-            f"• Response: `{data}`",
-            disable_web_page_preview=True,
-        )
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".txt") as tf:
+            tf.write(text)
+            tf.flush()
+            fname = tf.name
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(fname, "rb"), filename="index_result.txt")
+        try:
+            os.remove(fname)
+        except Exception:
+            pass
     else:
-        await update.message.reply_text(
-            "❌ Tạo chiến dịch thất bại.\n"
-            f"• HTTP Status: {status}\n"
-            f"• Response: `{data}`",
-            disable_web_page_preview=True,
-        )
+        await update.message.reply_text(text, disable_web_page_preview=True)
 
-    # Kết thúc phiên
     context.user_data.clear()
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Không hiểu lệnh. Gửi file Excel (.xlsx) hoặc dùng /indexweb <domain> hoặc /start.")
+    await update.message.reply_text("Không hiểu lệnh. Gửi file Excel (.xlsx) hoặc dùng /indexweb, /indexdomains hoặc /help.")
 
-# -------------------------
-# /indexweb handler
-# -------------------------
+# ===== /indexweb: quét sitemap một domain -> hỏi ngày =====
 async def indexweb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /indexweb <domain>
-    - Quét sitemap (ưu tiên https), bỏ qua lỗi SSL.
-    - Hỗ trợ sitemap index + urlset, kể cả .xml.gz.
-    - Gom URL, sau đó hỏi số ngày để gửi lên 1hping.
-    """
     args = context.args if hasattr(context, "args") else []
     if not args:
         await update.message.reply_text("Cú pháp: `/indexweb <domain>` (vd: `/indexweb abc.com`)", disable_web_page_preview=True)
@@ -416,22 +436,20 @@ async def indexweb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await send_typing(context, update.effective_chat.id)
-    await update.message.reply_text(f"Đang dò sitemap cho `{host}` (ưu tiên https, bỏ qua lỗi SSL)...", disable_web_page_preview=True)
+    await update.message.reply_text(
+        f"Đang dò sitemap cho `{host}` (ưu tiên https{' — bỏ qua SSL' if SKIP_SSL_VERIFY else ''})...",
+        disable_web_page_preview=True
+    )
 
-    # Bỏ qua xác thực SSL để vẫn truy cập được nếu chứng chỉ lỗi
     timeout = aiohttp.ClientTimeout(total=300)
-    connector = aiohttp.TCPConnector(ssl=False)  # BỎ QUA SSL
+    connector = aiohttp.TCPConnector(ssl=not SKIP_SSL_VERIFY)
     try:
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             entry_points = await _discover_sitemap_entry_points(session, host)
             if not entry_points:
-                await update.message.reply_text(
-                    "Không tìm thấy sitemap hợp lệ (sitemap_index.xml / sitemap.xml). Kiểm tra lại domain hoặc sitemap."
-                )
+                await update.message.reply_text("Không tìm thấy sitemap hợp lệ (sitemap_index.xml / sitemap.xml).")
                 return
-
             urls = await _collect_urls_from_sitemaps(session, entry_points, limit_depth=6)
-
     except Exception as e:
         logger.exception("Error while indexing web via sitemap")
         await update.message.reply_text(f"Lỗi khi quét sitemap: {e}")
@@ -441,14 +459,8 @@ async def indexweb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Không thu thập được URL nào từ sitemap.")
         return
 
-    # Loại trùng lần nữa (phòng trường hợp lặp từ nhiều entry)
-    seen = set()
-    deduped = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            deduped.append(u)
-
+    # dedupe
+    deduped = list(dict.fromkeys(urls))
     context.user_data["urls"] = deduped
     context.user_data["awaiting_days"] = True
 
@@ -457,19 +469,164 @@ async def indexweb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Bạn muốn chia ép trong **bao nhiêu ngày**? (nhập số nguyên, ví dụ: 1, 3, 7)"
     )
 
-# -------------------------
+# ===== /indexdomains: ép index hàng loạt domain trực tiếp =====
+def _parse_domains_raw(raw_tokens: list[str]) -> list[str]:
+    out = []
+    for t in raw_tokens:
+        if not t:
+            continue
+        for piece in re.split(r"[,\n\r]+", t):
+            p = piece.strip()
+            if p:
+                out.append(p)
+    # dedupe giữ thứ tự
+    seen = set()
+    deduped = []
+    for d in out:
+        if d not in seen:
+            seen.add(d)
+            deduped.append(d)
+    return deduped
+
+async def indexdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /indexdomains [days] domain1 domain2 ...
+    - Nếu token đầu là số -> days; nếu không -> days=1.
+    - Domain tách bằng dấu cách, dấu phẩy, hoặc xuống dòng.
+    """
+    args = context.args if hasattr(context, "args") else []
+    if not args:
+        await update.message.reply_text(
+            "Cú pháp: `/indexdomains [days] domain1 domain2 ...`\n"
+            "Ví dụ:\n"
+            "`/indexdomains 3 example.com abc.com`\n"
+            "`/indexdomains example.com,another.com`",
+            disable_web_page_preview=True,
+        )
+        return
+
+    days = 1
+    tokens = list(args)
+    if re.fullmatch(r"\d{1,4}", tokens[0]):
+        days = int(tokens.pop(0))
+        if days <= 0:
+            await update.message.reply_text("Số ngày phải >= 1.")
+            return
+        if days > 365:
+            await update.message.reply_text("Giới hạn tối đa 365 ngày.")
+            return
+
+    domains = _parse_domains_raw(tokens)
+    if not domains:
+        await update.message.reply_text("Không có domain hợp lệ trong tin nhắn.")
+        return
+
+    await send_typing(context, update.effective_chat.id)
+    await update.message.reply_text(
+        f"Nhận {len(domains)} domain. Bắt đầu quét sitemap và tạo campaign trong {days} ngày...\n"
+        f"(Chạy song song tối đa 3 domain mỗi lần; SSL {'bỏ qua' if SKIP_SSL_VERIFY else 'bật kiểm tra'})",
+        disable_web_page_preview=True
+    )
+
+    sem = asyncio.Semaphore(3)
+    timeout = aiohttp.ClientTimeout(total=300)
+    connector = aiohttp.TCPConnector(ssl=not SKIP_SSL_VERIFY)
+
+    async def _process_domain(domain: str) -> tuple[str, dict]:
+        async with sem:
+            host = _norm_domain(domain)
+            report: dict = {"domain": domain, "host": host, "urls_count": 0, "campaigns": [], "error": None}
+            if not host:
+                report["error"] = "Domain không hợp lệ"
+                return domain, report
+
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                    entry_points = await _discover_sitemap_entry_points(session, host)
+                    if not entry_points:
+                        report["error"] = "Không tìm thấy sitemap hợp lệ"
+                        return domain, report
+                    urls = await _collect_urls_from_sitemaps(session, entry_points, limit_depth=6)
+            except Exception as e:
+                logger.exception("Error while processing domain %s", domain)
+                report["error"] = f"Lỗi khi quét sitemap: {e}"
+                return domain, report
+
+            deduped = list(dict.fromkeys(urls))
+            report["urls_count"] = len(deduped)
+            if not deduped:
+                report["error"] = "Không thu thập được URL từ sitemap"
+                return domain, report
+
+            tg_user = update.effective_user
+            display_name = tg_user.full_name or tg_user.username or "User"
+            user_id = tg_user.id
+            base_campaign_name = sanitize_campaign_name(f"{display_name}_{user_id}_{host}")
+
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    batch_results = await call_1hping_in_batches(session, base_campaign_name, days, deduped, batch_size=BATCH_SIZE)
+            except Exception as e:
+                logger.exception("Error calling 1hping for domain %s", domain)
+                report["error"] = f"Lỗi gọi API 1hping: {e}"
+                return domain, report
+
+            for name, r in batch_results:
+                report["campaigns"].append({
+                    "name": name,
+                    "status": r.get("status"),
+                    "data_preview": _short(r.get("data"), 800),
+                })
+            return domain, report
+
+    tasks = [asyncio.create_task(_process_domain(d)) for d in domains]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    lines = []
+    for domain, rep in results:
+        if rep.get("error"):
+            lines.append(f"• {domain} — ❌ {rep['error']}")
+        else:
+            lines.append(f"• {domain} — ✅ URLs: {rep['urls_count']} — Campaigns: {len(rep['campaigns'])}")
+            for c in rep["campaigns"]:
+                status = c.get("status")
+                preview = c.get("data_preview") or ""
+                lines.append(f"    - {c['name']} — HTTP {status} — {preview}")
+
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".txt") as tf:
+            tf.write(text)
+            tf.flush()
+            fname = tf.name
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(fname, "rb"), filename="indexdomains_result.txt")
+        try:
+            os.remove(fname)
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text(text, disable_web_page_preview=True)
+
+# =========================
 # Entry
-# -------------------------
+# =========================
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Menu
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_menu))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("indexweb", indexweb))  # <-- thêm lệnh mới
 
+    # Index commands
+    app.add_handler(CommandHandler("indexweb", indexweb))
+    app.add_handler(CommandHandler("indexdomains", indexdomains))
+
+    # File & text flow
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # Unknown commands
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     logger.info("Bot is starting...")
